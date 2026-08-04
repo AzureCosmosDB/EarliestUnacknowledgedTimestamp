@@ -1,0 +1,15 @@
+## .NET / build artifacts
+bin/
+obj/
+publish/
+
+## Tool output (may contain account/metric data)
+output/
+**/output/
+
+## User-specific files
+*.user
+
+## Visual Studio local cache (machine-specific, do not share)
+.vs/
+**/.vs/

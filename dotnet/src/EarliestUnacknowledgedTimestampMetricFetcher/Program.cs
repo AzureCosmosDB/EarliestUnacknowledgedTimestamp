@@ -54,7 +54,16 @@ internal static class Program
             var subscriptionId = Prompts.ResolveRequired("Subscription ID", cli.Get("subscription"));
             var resourceGroup = Prompts.ResolveRequired("Resource Group name", cli.Get("resource-group"));
             var accountName = Prompts.ResolveRequired("Account name", cli.Get("account"));
-            var targetRegion = Prompts.ResolveRequired("Target Region (e.g. westus2)", cli.Get("region"));
+
+            // Source region, target region, and collection name are mandatory command-line
+            // arguments (enforced by the argument parser). The collection name may be empty.
+            var sourceRegion = cli.Get("source-region")!;
+            var targetRegion = cli.Get("target-region")!;
+            var collectionName = cli.GetAllowEmpty("collection")!;
+            var collectionNameText = collectionName.Length == 0 ? "(empty)" : collectionName;
+            Console.WriteLine($"Source Region: {sourceRegion} (from command line)");
+            Console.WriteLine($"Target Region: {targetRegion} (from command line)");
+            Console.WriteLine($"Collection name: {collectionNameText} (from command line)");
 
             // Determine the time window. Two modes:
             //   * error-start-time mode: fetch the period immediately before the error start
@@ -96,29 +105,69 @@ internal static class Program
 
             using var client = new MetricsRestClient(credential);
 
-            // 2. Discover the region dimension name from the metric definition.
+            // 2. Discover the dimension names from the metric definition.
             Console.WriteLine("Retrieving metric definitions...");
             var definitionsJson = await client
                 .GetMetricDefinitionsAsync(resourceUri, MetricNamespace)
                 .ConfigureAwait(false);
 
-            var regionDimension = MetricResultProcessor.DiscoverRegionDimension(definitionsJson, MetricName);
-            if (regionDimension is null)
+            var dimensionNames = MetricResultProcessor.GetDimensionNames(definitionsJson, MetricName);
+            if (dimensionNames is null)
             {
                 Console.Error.WriteLine(
-                    $"ERROR: Could not find metric '{MetricName}' or a region dimension on it for " +
-                    "this resource. Verify the account name and that the metric is available.");
+                    $"ERROR: Metric '{MetricName}' is not available for this resource. " +
+                    "Verify the account name and that the metric is available.");
                 return 3;
             }
 
-            Console.WriteLine($"Using region dimension: {regionDimension}");
-            var filter = $"{regionDimension} eq '{targetRegion}'";
+            var availableDimensions = dimensionNames.Count == 0 ? "none" : string.Join(", ", dimensionNames);
+
+            var sourceRegionDimension = MetricResultProcessor.FindDimension(
+                dimensionNames, new[] { "SourceRegion" }, "source");
+            if (sourceRegionDimension is null)
+            {
+                Console.Error.WriteLine(
+                    $"ERROR: Could not identify a source region dimension for metric '{MetricName}'. " +
+                    $"Available dimensions: {availableDimensions}.");
+                return 3;
+            }
+            Console.WriteLine($"Using source region dimension: {sourceRegionDimension}");
+
+            var targetRegionDimension = MetricResultProcessor.FindDimension(
+                dimensionNames, new[] { "TargetRegion", "Region" }, "region", "source");
+            if (targetRegionDimension is null)
+            {
+                Console.Error.WriteLine(
+                    $"ERROR: Could not identify a target region dimension for metric '{MetricName}'. " +
+                    $"Available dimensions: {availableDimensions}.");
+                return 3;
+            }
+            Console.WriteLine($"Using target region dimension: {targetRegionDimension}");
+
+            var collectionDimension = MetricResultProcessor.FindDimension(
+                dimensionNames, new[] { "CollectionName" }, "collection|container");
+            if (collectionDimension is null)
+            {
+                Console.Error.WriteLine(
+                    $"ERROR: Could not identify a collection name dimension for metric '{MetricName}'. " +
+                    $"Available dimensions: {availableDimensions}.");
+                return 3;
+            }
+            Console.WriteLine($"Using collection name dimension: {collectionDimension}");
+
+            var filter = string.Join(
+                " and ",
+                FilterClause(sourceRegionDimension, sourceRegion),
+                FilterClause(targetRegionDimension, targetRegion),
+                FilterClause(collectionDimension, collectionName));
 
             var interval = Interval;
             Console.WriteLine($"Using time grain (interval): {interval}");
 
             // 3. Query metric values.
-            Console.WriteLine("Querying metric values...");
+            Console.WriteLine(
+                $"Querying metric values for source region '{sourceRegion}', target region " +
+                $"'{targetRegion}', collection '{collectionNameText}'...");
             var valuesJson = await client
                 .GetMetricValuesAsync(
                     resourceUri,
@@ -132,15 +181,22 @@ internal static class Program
                 .ConfigureAwait(false);
 
             // 4. Write outputs.
-            var (csv, pointCount) = MetricResultProcessor.ToCsv(valuesJson, Aggregation, targetRegion);
+            var (csv, pointCount) = MetricResultProcessor.ToCsv(
+                valuesJson,
+                Aggregation,
+                new MetricResultProcessor.DimensionColumn(sourceRegionDimension, sourceRegion),
+                new MetricResultProcessor.DimensionColumn(targetRegionDimension, targetRegion),
+                new MetricResultProcessor.DimensionColumn(collectionDimension, collectionName));
             var (jsonPath, csvPath, outputDir, baseName) =
-                await WriteOutputsAsync(accountName, targetRegion, valuesJson, csv)
+                await WriteOutputsAsync(accountName, sourceRegion, targetRegion, collectionName, valuesJson, csv)
                     .ConfigureAwait(false);
 
             Console.WriteLine();
             Console.WriteLine("Done.");
             Console.WriteLine($"  Metric:      {MetricName}");
-            Console.WriteLine($"  Region:      {targetRegion}");
+            Console.WriteLine($"  Source:      {sourceRegion}");
+            Console.WriteLine($"  Target:      {targetRegion}");
+            Console.WriteLine($"  Collection:  {collectionNameText}");
             Console.WriteLine($"  Time range:  {Iso(startUtc)} -> {Iso(endUtc)} (UTC)");
             Console.WriteLine($"  Aggregation: {Aggregation}, interval {interval}");
             Console.WriteLine($"  Data points: {pointCount}");
@@ -149,7 +205,7 @@ internal static class Program
             if (pointCount == 0)
             {
                 Console.WriteLine();
-                Console.WriteLine("  Note: no data points were returned for this region and time range.");
+                Console.WriteLine("  Note: no data points were returned for the selected dimensions and time range.");
             }
 
             // 5. In error-start-time mode, compute and report the minimum non-zero value.
@@ -160,7 +216,9 @@ internal static class Program
                         outputDir,
                         baseName,
                         accountName,
+                        sourceRegion,
                         targetRegion,
+                        collectionNameText,
                         errorStartUtc,
                         startUtc,
                         endUtc,
@@ -216,7 +274,9 @@ internal static class Program
     private static async Task<(string JsonPath, string CsvPath, string OutputDir, string BaseName)>
         WriteOutputsAsync(
             string accountName,
-            string region,
+            string sourceRegion,
+            string targetRegion,
+            string collectionName,
             string json,
             string csv)
     {
@@ -224,7 +284,13 @@ internal static class Program
         Directory.CreateDirectory(outputDir);
 
         var stamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss");
-        var baseName = $"{Sanitize(accountName)}_{Sanitize(region)}_{stamp}";
+        var parts = new List<string> { Sanitize(accountName), Sanitize(sourceRegion), Sanitize(targetRegion) };
+        if (collectionName.Length > 0)
+        {
+            parts.Add(Sanitize(collectionName));
+        }
+        parts.Add(stamp);
+        var baseName = string.Join("_", parts);
         var jsonPath = Path.Combine(outputDir, baseName + ".json");
         var csvPath = Path.Combine(outputDir, baseName + ".csv");
 
@@ -238,7 +304,9 @@ internal static class Program
         string outputDir,
         string baseName,
         string accountName,
-        string region,
+        string sourceRegion,
+        string targetRegion,
+        string collectionNameText,
         DateTimeOffset errorStartUtc,
         DateTimeOffset windowStartUtc,
         DateTimeOffset windowEndUtc,
@@ -252,7 +320,9 @@ internal static class Program
         sb.AppendLine("======================================================");
         sb.AppendLine($"Metric:              {MetricName}");
         sb.AppendLine($"Account:             {accountName}");
-        sb.AppendLine($"Target region:       {region}");
+        sb.AppendLine($"Source region:       {sourceRegion}");
+        sb.AppendLine($"Target region:       {targetRegion}");
+        sb.AppendLine($"Collection name:     {collectionNameText}");
         sb.AppendLine($"Aggregation:         {Aggregation}");
         sb.AppendLine($"Error start time:    {Iso(errorStartUtc)} (UTC)");
         sb.AppendLine($"Lookback minutes:    {lookbackMinutes}");
@@ -281,6 +351,12 @@ internal static class Program
             .ConfigureAwait(false);
         return resultPath;
     }
+
+    /// <summary>
+    /// Builds an OData equality clause for a metric dimension, escaping single quotes.
+    /// </summary>
+    private static string FilterClause(string dimension, string value) =>
+        $"{dimension} eq '{value.Replace("'", "''")}'";
 
     private static string Num(double value) =>
         value.ToString("R", System.Globalization.CultureInfo.InvariantCulture);
@@ -315,10 +391,12 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("What this tool does:");
         Console.WriteLine($"  * It queries the metric '{MetricName}' for the");
-        Console.WriteLine("    specified time range and target region, using the");
+        Console.WriteLine("    specified time range, source region, target region, and");
+        Console.WriteLine("    collection name, using the");
         Console.WriteLine($"    '{Aggregation}' aggregation.");
         Console.WriteLine("  * It saves the complete result to a JSON file (raw API response)");
-        Console.WriteLine("    and a CSV file (one row per data point: timestamp, region, value).");
+        Console.WriteLine("    and a CSV file (one row per data point: timestamp, source region,");
+        Console.WriteLine("    target region, collection name, value).");
         Console.WriteLine("  * No further calculation is performed in this mode. To find the");
         Console.WriteLine("    minimum non-zero value in a period before an error, use the");
         Console.WriteLine("    --error-start-time option instead.");
@@ -346,7 +424,8 @@ internal static class Program
         Console.WriteLine($"    {lookbackMinutes}-MINUTE period immediately before the error start time,");
         Console.WriteLine($"    i.e. the window");
         Console.WriteLine($"    [{Iso(windowStartUtc)} -> {Iso(errorStartUtc)}] (UTC), using the");
-        Console.WriteLine($"    '{Aggregation}' aggregation for the target region.");
+        Console.WriteLine($"    '{Aggregation}' aggregation for the source region, target region,");
+        Console.WriteLine("    and collection name.");
         Console.WriteLine("  * It then scans every data point in that period and finds the");
         Console.WriteLine("    SMALLEST value that is NOT zero, along with the timestamp it was");
         Console.WriteLine("    emitted. That value is the reported result.");

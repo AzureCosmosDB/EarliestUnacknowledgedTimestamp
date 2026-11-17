@@ -17,7 +17,9 @@ internal sealed class CommandLineArgs
         ["subscription"] = new[] { "subscription", "s" },
         ["resource-group"] = new[] { "resource-group", "resourcegroup", "g" },
         ["account"] = new[] { "account", "a" },
-        ["region"] = new[] { "region", "r" },
+        ["source-region"] = new[] { "source-region", "sourceregion", "source" },
+        ["target-region"] = new[] { "target-region", "targetregion" },
+        ["collection"] = new[] { "collection", "collection-name", "collectionname", "c" },
         ["start"] = new[] { "start" },
         ["end"] = new[] { "end" },
         ["error-start-time"] = new[] { "error-start-time", "errorstarttime" },
@@ -90,6 +92,27 @@ internal sealed class CommandLineArgs
             }
         }
 
+        if (!result.HelpRequested)
+        {
+            if (result.Get("source-region") is null)
+            {
+                throw new ArgumentException("--source-region is required.");
+            }
+
+            if (result.Get("target-region") is null)
+            {
+                throw new ArgumentException("--target-region is required.");
+            }
+
+            // An empty collection name is allowed (selects the series whose collection name is
+            // empty), but the option itself must be supplied.
+            if (!result._values.ContainsKey("collection"))
+            {
+                throw new ArgumentException(
+                    "--collection is required. Use --collection=\"\" to select an empty collection name.");
+            }
+        }
+
         if (result._values.ContainsKey("error-start-time") &&
             (result._values.ContainsKey("start") || result._values.ContainsKey("end")))
         {
@@ -131,17 +154,30 @@ internal sealed class CommandLineArgs
     public string? Get(string canonicalName) =>
         _values.TryGetValue(canonicalName, out var v) && !string.IsNullOrWhiteSpace(v) ? v : null;
 
+    /// <summary>
+    /// Returns the value for a canonical option, including an empty value, or null if it was not
+    /// supplied.
+    /// </summary>
+    public string? GetAllowEmpty(string canonicalName) =>
+        _values.TryGetValue(canonicalName, out var v) ? v : null;
+
     public static string UsageText =>
         """
         Usage: EarliestUnacknowledgedTimestampMetricFetcher [options]
 
-        All options are optional. Any value not supplied on the command line will be
-        prompted for interactively.
+        Required options:
+              --source-region <name>    Source region dimension value (e.g. "West US 2")
+              --target-region <name>    Target region dimension value (e.g. "West Central US")
+          -c, --collection <name>       Collection (container) name dimension value. Use
+                                        --collection="" to select the series whose
+                                        collection name is empty.
 
+        Optional options (prompted for interactively when not supplied):
           -s, --subscription <id>       Azure Subscription ID
           -g, --resource-group <name>   Resource Group name
           -a, --account <name>          Cosmos DB account name
-          -r, --region <name>           Target Region (e.g. westus2)
+
+        Other options:
               --start <iso8601>         Start time in UTC (e.g. 2026-07-19T00:00:00Z)
               --end <iso8601>           End time in UTC (e.g. 2026-07-20T00:00:00Z)
               --error-start-time <iso8601>
@@ -161,10 +197,13 @@ internal sealed class CommandLineArgs
           * --error-start-time cannot be combined with --start or --end.
           * --error-start-time requires --lookback-minutes (a positive whole number).
           * Values with spaces must be quoted, e.g. --resource-group "my rg".
+          * --source is an alias for --source-region; --collection-name is an alias
+            for --collection.
 
         Examples:
-          EarliestUnacknowledgedTimestampMetricFetcher -s 00000000-0000-0000-0000-000000000000 -g my-rg -a my-account -r westus2
-          EarliestUnacknowledgedTimestampMetricFetcher --account my-account --region westus2 --start 2026-07-19T00:00:00Z --end 2026-07-20T00:00:00Z
-          EarliestUnacknowledgedTimestampMetricFetcher -a my-account -r westus2 --error-start-time 2026-07-24T20:30:00Z --lookback-minutes 60
+          EarliestUnacknowledgedTimestampMetricFetcher -s 00000000-0000-0000-0000-000000000000 -g my-rg -a my-account --source-region "West US 2" --target-region "West Central US" -c orders
+          EarliestUnacknowledgedTimestampMetricFetcher -a my-account --source-region "West US 2" --target-region "West Central US" -c orders --start 2026-07-19T00:00:00Z --end 2026-07-20T00:00:00Z
+          EarliestUnacknowledgedTimestampMetricFetcher -a my-account --source-region "West US 2" --target-region "West Central US" -c orders --error-start-time 2026-07-24T20:30:00Z --lookback-minutes 60
+          EarliestUnacknowledgedTimestampMetricFetcher -a my-account --source-region "West US 2" --target-region "West Central US" --collection=""
         """;
 }

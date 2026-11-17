@@ -5,9 +5,10 @@
     Retrieves the EarliestUnacknowledgedTimestampMetricView metric for an Azure Cosmos DB account.
 
 .DESCRIPTION
-    Uses Azure PowerShell to discover the metric's region dimension, query one-minute minimum
-    values, and write JSON and CSV output. Error-start-time mode also reports the minimum non-zero
-    value in a lookback window.
+    Uses Azure PowerShell to discover the metric's dimensions, query one-minute minimum values,
+    and write JSON and CSV output. Results are filtered by source region, target region, and
+    collection name. Error-start-time mode also reports the minimum non-zero value in a lookback
+    window.
 
 .PARAMETER SubscriptionId
     Azure subscription that contains the Cosmos DB account.
@@ -18,8 +19,15 @@
 .PARAMETER AccountName
     Name of the Cosmos DB account.
 
+.PARAMETER SourceRegion
+    Source region dimension value, for example "West US 2".
+
 .PARAMETER TargetRegion
     Target region dimension value, for example "West Central US".
+
+.PARAMETER CollectionName
+    Collection (container) name dimension value. Pass an empty string ("") to query the series
+    whose collection name is empty.
 
 .PARAMETER StartTime
     Start of the query range. Values without an offset are interpreted as UTC.
@@ -38,12 +46,21 @@
 
 .EXAMPLE
     .\Get-EarliestUnacknowledgedTimestampMetric.ps1 -SubscriptionId <id> `
-        -ResourceGroupName <group> -AccountName <account> -TargetRegion westus2
+        -ResourceGroupName <group> -AccountName <account> -SourceRegion "West US 2" `
+        -TargetRegion "West Central US" -CollectionName orders
 
 .EXAMPLE
     .\Get-EarliestUnacknowledgedTimestampMetric.ps1 -SubscriptionId <id> `
-        -ResourceGroupName <group> -AccountName <account> -TargetRegion "West Central US" `
+        -ResourceGroupName <group> -AccountName <account> -SourceRegion "West US 2" `
+        -TargetRegion "West Central US" -CollectionName orders `
         -ErrorStartTime "2026-07-24T20:30:00Z" -LookbackMinutes 60
+
+.EXAMPLE
+    .\Get-EarliestUnacknowledgedTimestampMetric.ps1 -SubscriptionId <id> `
+        -ResourceGroupName <group> -AccountName <account> -SourceRegion "West US 2" `
+        -TargetRegion "West Central US" -CollectionName ""
+
+    Queries the series whose collection name is empty.
 
 .LINK
     https://learn.microsoft.com/powershell/module/az.monitor/get-azmetric
@@ -67,9 +84,19 @@ param(
     [string]$AccountName,
 
     [Parameter(Mandatory = $true)]
+    [Alias('Source')]
+    [ValidateNotNullOrEmpty()]
+    [string]$SourceRegion,
+
+    [Parameter(Mandatory = $true)]
     [Alias('Region', 'r')]
     [ValidateNotNullOrEmpty()]
     [string]$TargetRegion,
+
+    [Parameter(Mandatory = $true)]
+    [Alias('Collection', 'c')]
+    [AllowEmptyString()]
+    [string]$CollectionName,
 
     [Parameter(ParameterSetName = 'TimeRange')]
     [ValidateNotNullOrEmpty()]
@@ -146,7 +173,7 @@ function Get-LocalizableStringValue {
     return [string]$InputObject
 }
 
-function Get-RegionDimensionName {
+function Get-MetricDimensionNames {
     param(
         [Parameter(Mandatory = $true)]
         [AllowEmptyCollection()]
@@ -169,8 +196,8 @@ function Get-RegionDimensionName {
         throw "Metric '$ExpectedMetricName' is not available for this resource."
     }
 
-    $dimensionNames = @(
-        $dimensions = Get-ObjectPropertyValue -InputObject $definition -Name 'Dimensions'
+    $dimensions = Get-ObjectPropertyValue -InputObject $definition -Name 'Dimensions'
+    return , @(
         foreach ($dimension in @($dimensions)) {
             $name = Get-LocalizableStringValue -InputObject $dimension
             if (-not [string]::IsNullOrWhiteSpace($name)) {
@@ -178,39 +205,62 @@ function Get-RegionDimensionName {
             }
         }
     )
-
-    $regionDimension = $dimensionNames |
-        Where-Object { $_ -match 'region' } |
-        Select-Object -First 1
-
-    if ($null -ne $regionDimension) {
-        return $regionDimension
-    }
-
-    if ($dimensionNames.Count -eq 1) {
-        return $dimensionNames[0]
-    }
-
-    $available = if ($dimensionNames.Count -eq 0) {
-        'none'
-    }
-    else {
-        $dimensionNames -join ', '
-    }
-
-    throw "Could not identify a region dimension for metric '$ExpectedMetricName'. Available dimensions: $available."
 }
 
-function Get-SeriesRegion {
+function Find-DimensionName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$DimensionNames,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$PreferredNames,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern,
+
+        [string]$ExcludePattern
+    )
+
+    foreach ($preferred in $PreferredNames) {
+        $match = $DimensionNames | Where-Object { $_ -ieq $preferred } | Select-Object -First 1
+        if ($null -ne $match) {
+            return $match
+        }
+    }
+
+    return $DimensionNames |
+        Where-Object {
+            $_ -match $Pattern -and
+            ([string]::IsNullOrEmpty($ExcludePattern) -or $_ -notmatch $ExcludePattern)
+        } |
+        Select-Object -First 1
+}
+
+function Format-DimensionList {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [string[]]$DimensionNames
+    )
+
+    if ($DimensionNames.Count -eq 0) {
+        return 'none'
+    }
+
+    return $DimensionNames -join ', '
+}
+
+function Get-SeriesDimensionValue {
     param(
         [Parameter(Mandatory = $true)]
         [object]$Series,
 
         [Parameter(Mandatory = $true)]
-        [string]$RegionDimension,
+        [string]$DimensionName,
 
-        [Parameter(Mandatory = $true)]
-        [string]$FallbackRegion
+        [AllowEmptyString()]
+        [string]$FallbackValue = ''
     )
 
     $metadataValues = Get-ObjectPropertyValue -InputObject $Series -Name 'Metadatavalues'
@@ -219,7 +269,7 @@ function Get-SeriesRegion {
             Get-ObjectPropertyValue -InputObject $metadata -Name 'Name'
         )
 
-        if ($name -ieq $RegionDimension -or $name -match 'region') {
+        if ($name -ieq $DimensionName) {
             $value = Get-ObjectPropertyValue -InputObject $metadata -Name 'Value'
             if (-not [string]::IsNullOrWhiteSpace([string]$value)) {
                 return [string]$value
@@ -227,7 +277,7 @@ function Get-SeriesRegion {
         }
     }
 
-    return $FallbackRegion
+    return $FallbackValue
 }
 
 function Format-UtcTimestamp {
@@ -362,18 +412,60 @@ $definitions = @(
         -DefaultProfile $azureContext
 )
 
-$regionDimension = Get-RegionDimensionName `
+$dimensionNames = Get-MetricDimensionNames `
     -Definitions $definitions `
     -ExpectedMetricName $metricName
-Write-Host "Using region dimension: $regionDimension"
+$availableDimensions = Format-DimensionList -DimensionNames $dimensionNames
 
-$metricFilter = New-AzMetricFilter `
-    -Dimension $regionDimension `
-    -Operator eq `
-    -Value $TargetRegion
+$sourceRegionDimension = Find-DimensionName `
+    -DimensionNames $dimensionNames `
+    -PreferredNames @('SourceRegion') `
+    -Pattern 'source'
+if ($null -eq $sourceRegionDimension) {
+    throw "Could not identify a source region dimension for metric '$metricName'. Available dimensions: $availableDimensions."
+}
+Write-Host "Using source region dimension: $sourceRegionDimension"
+
+$regionDimension = Find-DimensionName `
+    -DimensionNames $dimensionNames `
+    -PreferredNames @('TargetRegion', 'Region') `
+    -Pattern 'region' `
+    -ExcludePattern 'source'
+if ($null -eq $regionDimension) {
+    throw "Could not identify a target region dimension for metric '$metricName'. Available dimensions: $availableDimensions."
+}
+Write-Host "Using target region dimension: $regionDimension"
+
+$collectionDimension = Find-DimensionName `
+    -DimensionNames $dimensionNames `
+    -PreferredNames @('CollectionName') `
+    -Pattern 'collection|container'
+if ($null -eq $collectionDimension) {
+    throw "Could not identify a collection name dimension for metric '$metricName'. Available dimensions: $availableDimensions."
+}
+Write-Host "Using collection name dimension: $collectionDimension"
+
+$isCollectionNameEmpty = [string]::IsNullOrEmpty($CollectionName)
+
+# New-AzMetricFilter rejects empty values, so the empty-value clause is built directly.
+$collectionFilter = if ($isCollectionNameEmpty) {
+    "$collectionDimension eq ''"
+}
+else {
+    "$(New-AzMetricFilter -Dimension $collectionDimension -Operator eq -Value $CollectionName)"
+}
+
+$metricFilter = @(
+    "$(New-AzMetricFilter -Dimension $sourceRegionDimension -Operator eq -Value $SourceRegion)"
+    "$(New-AzMetricFilter -Dimension $regionDimension -Operator eq -Value $TargetRegion)"
+    $collectionFilter
+) -join ' and '
+
+$collectionNameText = if ($isCollectionNameEmpty) { '(empty)' } else { $CollectionName }
+$queryDescription = "source region '$SourceRegion', target region '$TargetRegion', collection '$collectionNameText'"
 
 Write-Host "Using time grain (interval): $timeGrain"
-Write-Host "Querying metric values for region '$TargetRegion'..."
+Write-Host "Querying metric values for $queryDescription..."
 $metrics = @(
     Get-AzMetric `
         -ResourceId $resourceId `
@@ -391,10 +483,18 @@ $rows = @(
     foreach ($metric in $metrics) {
         $timeSeries = Get-ObjectPropertyValue -InputObject $metric -Name 'Timeseries'
         foreach ($series in @($timeSeries)) {
-            $seriesRegion = Get-SeriesRegion `
+            $seriesSourceRegion = Get-SeriesDimensionValue `
                 -Series $series `
-                -RegionDimension $regionDimension `
-                -FallbackRegion $TargetRegion
+                -DimensionName $sourceRegionDimension `
+                -FallbackValue $SourceRegion
+            $seriesRegion = Get-SeriesDimensionValue `
+                -Series $series `
+                -DimensionName $regionDimension `
+                -FallbackValue $TargetRegion
+            $seriesCollectionName = Get-SeriesDimensionValue `
+                -Series $series `
+                -DimensionName $collectionDimension `
+                -FallbackValue $CollectionName
             $dataPoints = Get-ObjectPropertyValue -InputObject $series -Name 'Data'
 
             foreach ($point in @($dataPoints)) {
@@ -408,7 +508,9 @@ $rows = @(
                     else {
                         Format-UtcTimestamp -Value ([DateTimeOffset]$timestamp)
                     }
+                    sourceRegion = $seriesSourceRegion
                     targetRegion = $seriesRegion
+                    collectionName = $seriesCollectionName
                     minimum = if ($null -eq $minimum) { $null } else { [double]$minimum }
                 }
             }
@@ -422,11 +524,14 @@ $resolvedOutputPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderP
 $null = New-Item -ItemType Directory -Path $resolvedOutputPath -Force
 
 $stamp = [DateTime]::UtcNow.ToString('yyyyMMdd_HHmmss')
-$baseName = '{0}_{1}_{2}' -f (
+$baseNameParts = @(
     ConvertTo-SafeFileNamePart -Value $AccountName
-), (
+    ConvertTo-SafeFileNamePart -Value $SourceRegion
     ConvertTo-SafeFileNamePart -Value $TargetRegion
-), $stamp
+    if (-not $isCollectionNameEmpty) { ConvertTo-SafeFileNamePart -Value $CollectionName }
+    $stamp
+)
+$baseName = $baseNameParts -join '_'
 $jsonPath = Join-Path $resolvedOutputPath "$baseName.json"
 $csvPath = Join-Path $resolvedOutputPath "$baseName.csv"
 
@@ -437,7 +542,9 @@ $csvRows = @(
     foreach ($row in $rows) {
         [PSCustomObject][ordered]@{
             timestampUtc = $row.timestampUtc
+            sourceRegion = $row.sourceRegion
             targetRegion = $row.targetRegion
+            collectionName = $row.collectionName
             minimum = if ($null -eq $row.minimum) {
                 ''
             }
@@ -455,7 +562,7 @@ if ($csvRows.Count -gt 0) {
     $csvLines = @($csvRows | ConvertTo-Csv -NoTypeInformation)
 }
 else {
-    $csvLines = @('"timestampUtc","targetRegion","minimum"')
+    $csvLines = @('"timestampUtc","sourceRegion","targetRegion","collectionName","minimum"')
 }
 $csv = ($csvLines -join [Environment]::NewLine) + [Environment]::NewLine
 Write-Utf8File -Path $csvPath -Content $csv
@@ -463,7 +570,9 @@ Write-Utf8File -Path $csvPath -Content $csv
 Write-Host ''
 Write-Host 'Done.'
 Write-Host "  Metric:      $metricName"
-Write-Host "  Region:      $TargetRegion"
+Write-Host "  Source:      $SourceRegion"
+Write-Host "  Target:      $TargetRegion"
+Write-Host "  Collection:  $collectionNameText"
 Write-Host "  Time range:  $(Format-UtcTimestamp -Value $startUtc) -> $(Format-UtcTimestamp -Value $endUtc) (UTC)"
 Write-Host "  Aggregation: $aggregation, interval $timeGrain"
 Write-Host "  Data points: $($rows.Count)"
@@ -471,7 +580,7 @@ Write-Host "  JSON file:   $jsonPath"
 Write-Host "  CSV file:    $csvPath"
 if ($rows.Count -eq 0) {
     Write-Host ''
-    Write-Host '  Note: no data points were returned for this region and time range.'
+    Write-Host '  Note: no data points were returned for the selected dimensions and time range.'
 }
 
 if ($errorMode) {
@@ -493,7 +602,9 @@ if ($errorMode) {
         '=========================================================================='
         "Metric:              $metricName"
         "Account:             $AccountName"
+        "Source region:       $SourceRegion"
         "Target region:       $TargetRegion"
+        "Collection name:     $collectionNameText"
         "Aggregation:         $aggregation"
         "Error start time:    $(Format-UtcTimestamp -Value $endUtc) (UTC)"
         "Lookback minutes:    $LookbackMinutes"

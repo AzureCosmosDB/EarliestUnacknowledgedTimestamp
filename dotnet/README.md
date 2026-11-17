@@ -1,8 +1,8 @@
 # .NET sample
 
 This sample builds a self-contained Windows command-line tool that retrieves
-`EarliestUnacknowledgedTimestampMetricView` from Azure Monitor for a Cosmos DB account and target
-region.
+`EarliestUnacknowledgedTimestampMetricView` from Azure Monitor for a Cosmos DB account. Results are
+filtered by source region, target region, and collection name.
 
 ## Prerequisites
 
@@ -44,7 +44,9 @@ The publish script also accepts `-Runtime` and `-Configuration`:
 | `--subscription <id>` | `-s` | Azure subscription ID. |
 | `--resource-group <name>` | `-g` | Resource group name. |
 | `--account <name>` | `-a` | Cosmos DB account name. |
-| `--region <name>` | `-r` | Target region, for example `West Central US`. |
+| `--source-region <name>` | `--source` | **Required.** Source region dimension value, for example `West US 2`. |
+| `--target-region <name>` | | **Required.** Target region dimension value, for example `West Central US`. |
+| `--collection <name>` | `-c`, `--collection-name` | **Required.** Collection (container) name dimension value. Use `--collection=""` to select the series whose collection name is empty. |
 | `--start <iso8601>` | | Start of the UTC query range. |
 | `--end <iso8601>` | | End of the UTC query range. |
 | `--error-start-time <iso8601>` | | End of the error lookback window. |
@@ -55,10 +57,14 @@ Long options also accept `--name=value`. Quote values that contain spaces.
 
 ## Interactive mode
 
-Run the executable without parameters to enter the required values interactively:
+`--source-region`, `--target-region`, and `--collection` must be supplied on the command line. The
+subscription, resource group, and account name are prompted for when omitted:
 
 ```powershell
-.\EarliestUnacknowledgedTimestampMetricFetcher.exe
+.\EarliestUnacknowledgedTimestampMetricFetcher.exe `
+    --source-region "West US 2" `
+    --target-region "West Central US" `
+    --collection "<collection-name>"
 ```
 
 ## Query the last 24 hours
@@ -70,7 +76,9 @@ Supply the resource details and omit the time options. Press Enter at both time 
     -s "<subscription-id>" `
     -g "<resource-group>" `
     -a "<account-name>" `
-    -r "West Central US"
+    --source-region "West US 2" `
+    --target-region "West Central US" `
+    --collection "<collection-name>"
 ```
 
 ## Query a specific time range
@@ -80,7 +88,9 @@ Supply the resource details and omit the time options. Press Enter at both time 
     -s "<subscription-id>" `
     -g "<resource-group>" `
     -a "<account-name>" `
-    -r "West Central US" `
+    --source-region "West US 2" `
+    --target-region "West Central US" `
+    --collection "<collection-name>" `
     --start "2026-07-19T00:00:00Z" `
     --end "2026-07-20T00:00:00Z"
 ```
@@ -97,7 +107,9 @@ Use `--error-start-time` and `--lookback-minutes` together:
     -s "<subscription-id>" `
     -g "<resource-group>" `
     -a "<account-name>" `
-    -r "West Central US" `
+    --source-region "West US 2" `
+    --target-region "West Central US" `
+    --collection "<collection-name>" `
     --error-start-time "2026-07-24T20:30:00Z" `
     --lookback-minutes 60
 ```
@@ -107,6 +119,16 @@ first occurrence of the smallest non-zero value in the window. If the window con
 values, the result is zero.
 
 `--error-start-time` cannot be combined with `--start` or `--end`.
+
+## Query an empty collection name
+
+```powershell
+.\EarliestUnacknowledgedTimestampMetricFetcher.exe `
+    -a "<account-name>" `
+    --source-region "West US 2" `
+    --target-region "West Central US" `
+    --collection=""
+```
 
 ## Authentication
 
@@ -118,7 +140,8 @@ metrics from the Cosmos DB account.
 Files are written to an `output` directory beside the executable:
 
 - **JSON**: the raw Azure Monitor REST response.
-- **CSV**: one row per data point with `timestampUtc`, `targetRegion`, and `minimum` columns.
+- **CSV**: one row per data point with `timestampUtc`, `sourceRegion`, `targetRegion`,
+  `collectionName`, and `minimum` columns.
 - **`_result.txt`**: the minimum non-zero result in error-start-time mode.
 
 ## Troubleshooting
@@ -126,4 +149,4 @@ Files are written to an `output` directory beside the executable:
 - **Sign-in failed or was canceled**: run the tool again and complete browser authentication.
 - **403 Forbidden**: grant the signed-in account at least the **Monitoring Reader** role.
 - **404 Not Found**: verify the subscription, resource group, and account name.
-- **No data points**: verify the target region and UTC time range.
+- **No data points**: verify the source region, target region, collection name, and UTC time range.
